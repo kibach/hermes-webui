@@ -314,10 +314,20 @@ class TestIssue765FollowupHardening:
         t2.join(timeout=5)
 
         assert not errors, f"Concurrent same-session saves should not fail: {errors}"
-        assert len(replace_sources) == 2, f"Expected 2 replace calls, got {replace_sources}"
-        assert len(set(replace_sources)) == 2, (
+        # Session.save() now writes the main file + a metadata sidecar; each
+        # thread produces two os.replace() calls (one per file). The original
+        # invariant is that no two threads share a tmp path. Filter out the
+        # sidecar replace calls (they contain `.meta` in the source path).
+        main_json_replacements = [
+            src for src in replace_sources
+            if '.meta' not in src
+        ]
+        assert len(main_json_replacements) == 2, (
+            f"Expected 2 main JSON replace calls, got {main_json_replacements}"
+        )
+        assert len(set(main_json_replacements)) == 2, (
             "Concurrent same-session saves must use distinct temp files; "
-            f"got {replace_sources}"
+            f"got {main_json_replacements}"
         )
         data = json.loads(s.path.read_text(encoding="utf-8"))
         assert data["session_id"] == "same_sid"

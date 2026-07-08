@@ -344,7 +344,10 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
                 try:
                     s = _load_session_from_path(p)
                     if s:
-                        c = s.compact()
+                        # The index is a metadata-only cache; it never needs the
+                        # full anchor_activity_scenes / context_messages payloads.
+                        # Keeping them out keeps _index.json small and fast to read.
+                        c = s.compact(metadata_only=True)
                         sid = c.get('session_id')
                         if sid:
                             # Dedup by session_id: prefer entry with more messages
@@ -362,7 +365,7 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
             existing_ids = set(entry_map.keys())
             with LOCK:
                 in_memory_entries = [
-                    s.compact()
+                    s.compact(metadata_only=True)
                     for s in SESSIONS.values()
                     if s.session_id not in existing_ids
                 ]
@@ -397,7 +400,7 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
                 raise ValueError("session index must be a list")
             with LOCK:
                 in_memory_ids = set(SESSIONS.keys())
-                updated_map = {s.session_id: s.compact() for s in updates}
+                updated_map = {s.session_id: s.compact(metadata_only=True) for s in updates}
 
             existing = [
                 e for e in existing
@@ -771,7 +774,7 @@ def _clear_webui_deleted_session_tombstone(sid: str) -> None:
             logger.debug("Failed to remove empty webui deleted-session tombstone", exc_info=True)
 
 
-def _active_stream_ids():
+def _active_stream_ids() -> set[str]:
     with STREAMS_LOCK:
         active_ids = set(STREAMS.keys())
     # STREAMS tracks the browser/SSE observation path. A worker can still be
@@ -783,6 +786,50 @@ def _active_stream_ids():
     with _cfg.ACTIVE_RUNS_LOCK:
         active_ids.update(_cfg.ACTIVE_RUNS.keys())
     return active_ids
+
+
+_ACTIVE_STREAM_IDS_CACHE: tuple[float, set[str], int, int] = (0.0, set(), -1, -1)
+_ACTIVE_STREAM_IDS_CACHE_LOCK = threading.Lock()
+_ACTIVE_STREAM_IDS_CACHE_TTL_SECONDS = 0.1
+
+
+def _cached_active_stream_ids() -> set[str]:
+    """Return the active stream/run ids, caching the result for ~1 second.
+
+    The sidebar rebuild calls this once per request; under concurrent polls the
+    cache avoids repeated lock acquisition on the hot STREAMS/ACTIVE_RUNS
+    registries. A short TTL keeps the cached set fresh enough for UI streaming
+    indicators. The cache also invalidates when the registry sizes change, so
+    direct mutations (tests, stream registration) are reflected immediately.
+    """
+    global _ACTIVE_STREAM_IDS_CACHE
+    now = time.monotonic()
+    cached_at, cached_ids, cached_streams_len, cached_runs_len = _ACTIVE_STREAM_IDS_CACHE
+    if (
+        now - cached_at < _ACTIVE_STREAM_IDS_CACHE_TTL_SECONDS
+        and cached_streams_len == len(STREAMS)
+        and cached_runs_len == len(_cfg.ACTIVE_RUNS)
+    ):
+        return cached_ids
+    with _ACTIVE_STREAM_IDS_CACHE_LOCK:
+        cached_at, cached_ids, cached_streams_len, cached_runs_len = _ACTIVE_STREAM_IDS_CACHE
+        if (
+            now - cached_at < _ACTIVE_STREAM_IDS_CACHE_TTL_SECONDS
+            and cached_streams_len == len(STREAMS)
+            and cached_runs_len == len(_cfg.ACTIVE_RUNS)
+        ):
+            return cached_ids
+        fresh_ids = _active_stream_ids()
+        try:
+            streams_len = len(STREAMS)
+        except Exception:
+            streams_len = -1
+        try:
+            runs_len = len(_cfg.ACTIVE_RUNS)
+        except Exception:
+            runs_len = -1
+        _ACTIVE_STREAM_IDS_CACHE = (now, fresh_ids, streams_len, runs_len)
+        return fresh_ids
 
 
 def _append_recovered_turn_to_context(session, recovered: dict) -> None:
@@ -977,8 +1024,15 @@ def _read_file_head(path: Path, max_prefix_bytes: int = 4096) -> str:
         return fp.read(max_prefix_bytes).decode('utf-8', errors='ignore')
 
 
-def _read_metadata_json_prefix(path, max_prefix_bytes=65536):
-    """Read only the metadata portion before the top-level messages array."""
+def _read_metadata_json_prefix(path: Path, max_prefix_bytes: int = 65536) -> str | None:
+    """Read only the metadata portion before the top-level messages array.
+
+    DEPRECATED: This function is retained only for sessions created before the
+    ``.json.meta`` sidecar was introduced. It is O(n²) for large metadata and
+    has a small fixed prefix cap. New sessions always write a sidecar on save,
+    and ``load_metadata_only()`` falls back to a full load + sidecar generation
+    when this function cannot produce a valid prefix. Do not add new callers.
+    """
     buf = ''
     with open(path, 'r', encoding='utf-8') as f:
         while len(buf.encode('utf-8')) < max_prefix_bytes:
@@ -994,6 +1048,233 @@ def _read_metadata_json_prefix(path, max_prefix_bytes=65536):
                 prefix = prefix[:-1].rstrip()
             return f'{prefix}\n}}'
     return None
+
+
+# ── Sidecar metadata cache for fast metadata-only loads ──────────────────────
+# Each <sid>.json may have a <sid>.json.meta file containing a small,
+# deterministic subset of the session metadata plus source-file fingerprints.
+# The sidecar is a cache only: if it is missing, stale, or corrupt, we fall
+# back to reading the main file. This keeps load_metadata_only() fast without
+# changing the on-disk format of the main session file.
+_METADATA_SIDECAR_SCHEMA_VERSION = 1
+
+
+def _session_metadata_sidecar_path(session_path: Path) -> Path:
+    return session_path.with_suffix('.json.meta')
+
+
+def _compute_string_sha256(data: str | bytes) -> str:
+    h = hashlib.sha256()
+    if isinstance(data, str):
+        h.update(data.encode('utf-8'))
+    else:
+        h.update(data)
+    return h.hexdigest()
+
+
+def _compute_file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _build_metadata_sidecar_payload(
+    session_path: Path,
+    metadata: dict,
+    payload_hash: str | None = None,
+) -> dict:
+    """Build a sidecar payload for the just-written *session_path*.
+
+    If *payload_hash* is provided (the SHA-256 of the serialized main-file
+    payload from ``save()``), it is stored as ``_source_sha256`` and used as the
+    fast-path validity check. The payload hash lets the sidecar skip re-reading
+    and re-hashing the (possibly 12 MB) main file on every save, and it removes
+    the race where a concurrent save lands between the main-file replace and
+    the sidecar's stat/hash. When *payload_hash* is absent the main file is
+    hashed from disk as a fallback.
+    """
+    st = session_path.stat()
+    if payload_hash is None:
+        payload_hash = _compute_file_sha256(session_path)
+    return {
+        '_meta_schema_version': _METADATA_SIDECAR_SCHEMA_VERSION,
+        '_source_mtime_ns': st.st_mtime_ns,
+        '_source_size': st.st_size,
+        '_source_sha256': payload_hash,
+        'metadata': metadata,
+    }
+
+
+def _write_session_metadata_sidecar(
+    session_path: Path,
+    metadata: dict,
+    payload_hash: str | None = None,
+) -> None:
+    """Write or refresh the metadata sidecar for *session_path*.
+
+    Callers must have just written *session_path* atomically; this captures
+    the new mtime/size/checksum. Failures are best-effort: a missing sidecar
+    simply forces the next load_metadata_only() to fall back to the main file.
+    """
+    sidecar_path = _session_metadata_sidecar_path(session_path)
+    payload = _build_metadata_sidecar_payload(session_path, metadata, payload_hash)
+    tmp = sidecar_path.with_suffix(
+        f'.meta.tmp.{os.getpid()}.{threading.current_thread().ident}'
+    )
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(',', ':'))
+            f.flush()
+        _safe_replace(tmp, sidecar_path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        logger.debug(
+            'Failed to write metadata sidecar for %s', session_path, exc_info=True
+        )
+
+
+def _validate_metadata_sidecar(
+    session_path: Path,
+    sidecar: dict,
+) -> dict | None:
+    """Return sidecar['metadata'] if it matches the current main file.
+
+    Fast path: the main file's mtime_ns and size are unchanged since the
+    sidecar was written, and the sidecar carries the payload hash captured at
+    save time. Because ``save()`` atomically replaces the main file and then
+    writes the sidecar from the same serialized payload, matching stat metadata
+    means the sidecar is valid without reading the main file.
+
+    Slow path: stat metadata changed -> SHA-256 verification against the main
+    file. This also covers external edits or restores from backup.
+    """
+    if not isinstance(sidecar, dict):
+        logger.debug("metadata sidecar rejected: not a dict for %s", session_path)
+        return None
+    if sidecar.get('_meta_schema_version') != _METADATA_SIDECAR_SCHEMA_VERSION:
+        logger.debug(
+            "metadata sidecar rejected: schema version %r for %s",
+            sidecar.get('_meta_schema_version'), session_path,
+        )
+        return None
+    metadata = sidecar.get('metadata')
+    if not isinstance(metadata, dict):
+        logger.debug("metadata sidecar rejected: metadata missing for %s", session_path)
+        return None
+    needed = {'session_id', 'title', 'created_at', 'updated_at'}
+    if not needed.issubset(metadata.keys()):
+        logger.debug("metadata sidecar rejected: missing required keys for %s", session_path)
+        return None
+    try:
+        st = session_path.stat()
+    except OSError:
+        logger.debug("metadata sidecar rejected: main file unreadable for %s", session_path)
+        return None
+    cached_mtime = sidecar.get('_source_mtime_ns')
+    cached_size = sidecar.get('_source_size')
+    cached_sha = sidecar.get('_source_sha256')
+    if not isinstance(cached_sha, str):
+        logger.debug("metadata sidecar rejected: no checksum for %s", session_path)
+        return None
+    if cached_mtime == st.st_mtime_ns and cached_size == st.st_size:
+        logger.debug("metadata sidecar hit (stat+payload_hash) for %s", session_path)
+        return metadata
+    try:
+        if _compute_file_sha256(session_path) == cached_sha:
+            logger.debug("metadata sidecar hit (sha256) for %s", session_path)
+            return metadata
+    except Exception:
+        pass
+    logger.debug("metadata sidecar stale for %s", session_path)
+    return None
+
+
+def _load_session_metadata_sidecar(session_path: Path) -> dict | None:
+    """Load and validate the metadata sidecar for *session_path*.
+
+    Returns the validated metadata dict, or None if the sidecar is missing,
+    stale, or invalid. Logs the reason at debug level for observability.
+    """
+    sidecar_path = _session_metadata_sidecar_path(session_path)
+    try:
+        with open(sidecar_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+    except FileNotFoundError:
+        logger.debug("metadata sidecar missing for %s", session_path)
+        return None
+    except Exception:
+        logger.debug("metadata sidecar unreadable for %s", session_path, exc_info=True)
+        return None
+    return _validate_metadata_sidecar(session_path, payload)
+
+
+def _delete_session_metadata_sidecar(session_path: Path) -> None:
+    sidecar_path = _session_metadata_sidecar_path(session_path)
+    try:
+        sidecar_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+# Ordered list of metadata-only fields persisted in session JSON and in the
+# optional <sid>.json.meta sidecar. Kept at module level so save(),
+# load_metadata_only(), and the sidecar helpers share the same contract.
+_SESSION_METADATA_FIELDS = [
+    'session_id', 'title', 'workspace', 'model', 'model_provider', 'created_at', 'updated_at',
+    'pinned', 'archived', 'project_id', 'profile',
+    'input_tokens', 'output_tokens', 'estimated_cost',
+    'cache_read_tokens', 'cache_write_tokens',
+    'personality', 'active_stream_id',
+    'pending_user_message', 'pending_attachments', 'pending_started_at', 'pending_user_source',
+    'compression_anchor_visible_idx', 'compression_anchor_message_key',
+    'compression_anchor_summary', 'pre_compression_snapshot',
+    'context_engine', 'compression_anchor_engine', 'compression_anchor_mode',
+    'compression_anchor_details', 'context_engine_state',
+    'context_length', 'threshold_tokens', 'last_prompt_tokens',
+    'truncation_watermark',
+    'truncation_boundary',
+    'compression_recovery', 'recommended_recovery_action',
+    'compression_recovery_source_session_id', 'compression_recovery_action',
+    'clear_generation',
+    'gateway_routing', 'gateway_routing_history', 'llm_title_generated', 'manual_title',
+    'parent_session_id',
+    'worktree_path', 'worktree_branch', 'worktree_repo_root', 'worktree_created_at',
+    'is_cli_session', 'source_tag', 'raw_source', 'session_source', 'source_label', 'read_only',
+    'enabled_toolsets', 'composer_draft', 'anchor_activity_scenes',
+]
+
+
+def _metadata_dict_from_session(session: "Session") -> dict:
+    """Return the deterministic metadata subset for sidecar caching."""
+    meta = {k: getattr(session, k, None) for k in _SESSION_METADATA_FIELDS}
+    meta['message_count'] = len(session.messages or [])
+    return meta
+
+
+def _session_from_metadata_dict(parsed: dict) -> "Session":
+    """Build a metadata-only Session from a parsed metadata dict."""
+    needed = {'session_id', 'title', 'created_at', 'updated_at'}
+    if not needed.issubset(parsed.keys()):
+        raise ValueError("parsed metadata missing required keys")
+    parsed = {**parsed, 'messages': [], 'tool_calls': []}
+    return Session(**parsed)
+
+
+def _write_sidecar_for_session_path(session_path: Path, session: "Session") -> None:
+    """Write the metadata sidecar for *session_path* from a full Session object.
+
+    Used when the sidecar is missing and we have already paid the cost of a full
+    load (e.g. legacy fallback, manual recovery).
+    """
+    try:
+        _write_session_metadata_sidecar(session_path, _metadata_dict_from_session(session))
+    except Exception:
+        pass
 
 
 def _load_session_from_path(path: Path) -> "Session | None":
@@ -1209,38 +1490,16 @@ class Session:
         # Write metadata fields first so load_metadata_only() can read them
         # without parsing the full messages array (which may be 400KB+).
         # Fields are listed in the order they should appear in the JSON file.
-        METADATA_FIELDS = [
-            'session_id', 'title', 'workspace', 'model', 'model_provider', 'created_at', 'updated_at',
-            'pinned', 'archived', 'project_id', 'profile',
-            'input_tokens', 'output_tokens', 'estimated_cost',
-            'cache_read_tokens', 'cache_write_tokens',
-            'personality', 'active_stream_id',
-            'pending_user_message', 'pending_attachments', 'pending_started_at', 'pending_user_source',
-            'compression_anchor_visible_idx', 'compression_anchor_message_key',
-            'compression_anchor_summary', 'pre_compression_snapshot',
-            'context_engine', 'compression_anchor_engine', 'compression_anchor_mode',
-            'compression_anchor_details', 'context_engine_state',
-            'context_length', 'threshold_tokens', 'last_prompt_tokens',
-            'compression_recovery', 'recommended_recovery_action',
-            'compression_recovery_source_session_id', 'compression_recovery_action',
-            'truncation_watermark',
-            'truncation_boundary',
-            'clear_generation',
-            'gateway_routing', 'gateway_routing_history', 'llm_title_generated', 'manual_title',
-            'parent_session_id',
-            'worktree_path', 'worktree_branch', 'worktree_repo_root', 'worktree_created_at',
-            'is_cli_session', 'source_tag', 'raw_source', 'session_source', 'source_label', 'read_only',
-            'enabled_toolsets', 'composer_draft', 'anchor_activity_scenes',
-        ]
-        meta = {k: getattr(self, k, None) for k in METADATA_FIELDS}
+        meta = {k: getattr(self, k, None) for k in _SESSION_METADATA_FIELDS}
         meta['message_count'] = len(self.messages or [])
         meta['messages'] = self.messages
         meta['tool_calls'] = self.tool_calls
-        # Fields not in METADATA_FIELDS (e.g. last_usage) go at the end
+        # Fields not in _SESSION_METADATA_FIELDS (e.g. last_usage) go at the end
         extra = {k: v for k, v in self.__dict__.items()
-                 if k not in METADATA_FIELDS and k not in ('messages', 'tool_calls')
+                 if k not in _SESSION_METADATA_FIELDS and k not in ('messages', 'tool_calls')
                  and not k.startswith('_')}
         payload = json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
+        payload_hash = _compute_string_sha256(payload)
 
         # ── #1558 backup safeguard ──────────────────────────────────────
         # Before overwriting the session file, copy the previous version to
@@ -1318,6 +1577,22 @@ class Session:
             except Exception:
                 pass
             raise
+
+        # Write a deterministic metadata sidecar so load_metadata_only() can
+        # avoid parsing the full messages array. The sidecar is a cache only;
+        # load_metadata_only() validates it against the main file and falls
+        # back to a full load if it is stale or corrupt.
+        try:
+            _write_session_metadata_sidecar(
+                self.path,
+                _metadata_dict_from_session(self),
+                payload_hash=payload_hash,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to write metadata sidecar for %s", self.session_id, exc_info=True
+            )
+
         if not skip_index:
             _write_session_index(updates=[self])
 
@@ -1385,13 +1660,34 @@ class Session:
         if not p.exists():
             return None
         try:
-            prefix = _read_metadata_json_prefix(p)
-            if not prefix:
-                return cls.load(sid)
-            parsed = json.loads(prefix)
-            needed = {'session_id', 'title', 'created_at', 'updated_at'}
-            if not needed.issubset(parsed.keys()):
-                return cls.load(sid)
+            parsed = _load_session_metadata_sidecar(p)
+            if parsed is None:
+                prefix = _read_metadata_json_prefix(p)
+                if prefix:
+                    parsed = json.loads(prefix)
+                    needed = {'session_id', 'title', 'created_at', 'updated_at'}
+                    if not needed.issubset(parsed.keys()):
+                        parsed = None
+                if parsed is None:
+                    # Stale or missing sidecar. Read the actual file (bypass the
+                    # in-memory SESSIONS cache so an externally mutated main
+                    # file produces a fresh sidecar), then cache a sidecar for
+                    # future metadata-only loads.
+                    _delete_session_metadata_sidecar(p)
+                    session = _load_session_from_path(p)
+                    if session is not None:
+                        _write_sidecar_for_session_path(p, session)
+                    return session
+                # We parsed metadata from the legacy prefix reader; refresh the
+                # sidecar so the next metadata-only load can skip parsing entirely.
+                # Overwrite is intentional: if we reached this branch, the existing
+                # sidecar was missing or stale.
+                try:
+                    sidecar_meta = {k: v for k, v in parsed.items()
+                                    if k not in ('messages', 'tool_calls')}
+                    _write_session_metadata_sidecar(p, sidecar_meta)
+                except Exception:
+                    pass
             parsed['messages'] = []
             parsed['tool_calls'] = []
             session = cls(**parsed)
@@ -1402,28 +1698,23 @@ class Session:
                     index_message_count = index_message_counts.get(str(sid))
                 else:
                     index_message_count = _lookup_index_message_count(sid)
-            # Modern sidecars carry an accurate message_count, so it is the
-            # source of truth and we skip the per-row _index.json read in the
-            # common case. The sidebar index is only a cache (it can lag behind
-            # external sidecar appends/backfills), so consult it solely as a
-            # fallback when the sidecar has no count. When both are present we
-            # still take the largest known count as a defensive measure.
             known_counts = [
                 count for count in (index_message_count, sidecar_message_count)
                 if count is not None
             ]
             session._metadata_message_count = max(known_counts) if known_counts else None
-            # Mark this session as a metadata-only stub. save() refuses to write
-            # such a session because doing so would atomically replace the
-            # on-disk JSON with messages=[], wiping the conversation. Any
-            # caller that needs to mutate persisted state on a metadata-only
-            # session must reload it with metadata_only=False first.
-            # See #1558 — v0.50.279 _clear_stale_stream_state() data-loss bug.
             session._loaded_metadata_only = True
             return session
         except Exception:
-            # Corrupt prefix or decode error — fall back to full load
-            return cls.load(sid)
+            # Corrupt sidecar or decode error — fall back to full load.
+            session = None
+            try:
+                session = cls.load(sid)
+                if session is not None:
+                    _write_sidecar_for_session_path(p, session)
+            except Exception:
+                pass
+            return session
 
     @staticmethod
     def _compute_user_message_count(messages) -> int:
@@ -1461,7 +1752,7 @@ class Session:
                     n += 1
         return n
 
-    def compact(self, include_runtime=False, active_stream_ids=None) -> dict:
+    def compact(self, include_runtime=False, active_stream_ids=None, metadata_only=False) -> dict:
         active_stream_ids = active_stream_ids if active_stream_ids is not None else set()
         has_pending_user_message = bool(self.pending_user_message)
         message_count = (
@@ -1474,7 +1765,7 @@ class Session:
         last_message_at = _last_message_timestamp(self.messages) or self.updated_at
         if has_pending_user_message and self.pending_started_at:
             last_message_at = self.pending_started_at
-        return {
+        result = {
             'session_id': self.session_id,
             'title': self.title,
             'workspace': self.workspace,
@@ -1541,6 +1832,13 @@ class Session:
                 self.active_stream_id, active_stream_ids
             ) if include_runtime else False,
         }
+        # Metadata-only consumers (e.g. GET /api/session?messages=0) do not receive
+        # the transcript, so large highlight/context arrays are useless and only
+        # bloat the response and redaction pass. Omit them in that mode.
+        if not metadata_only:
+            result['anchor_activity_scenes'] = self.anchor_activity_scenes
+            result['context_messages'] = self.context_messages
+        return result
 
 def _get_profile_home(profile) -> Path:
     """Resolve the hermes agent home directory for the given profile.
@@ -3129,11 +3427,10 @@ def _cached_session_lags_disk(cached) -> bool:
 def _persisted_message_count(sid) -> int | None:
     """Return the on-disk message count for *sid* without a full load (#4765).
 
-    Reads only the sidecar metadata prefix (and falls back to the sidebar
-    ``_index.json`` count) so the eviction safety check stays cheap even while
-    the global ``LOCK`` is held. Returns ``None`` when the sidecar is missing or
-    its count cannot be determined — callers treat that as "do not evict",
-    because we must never drop an in-memory session we cannot prove is on disk.
+    Uses the metadata sidecar when available; falls back to the legacy prefix
+    reader and then to the sidebar index. Returns ``None`` when no source can
+    determine the count — callers treat that as "do not evict", because we
+    must never drop an in-memory session we cannot prove is on disk.
     """
     if not is_safe_session_id(sid):
         return None
@@ -3141,14 +3438,17 @@ def _persisted_message_count(sid) -> int | None:
     if not p.exists():
         return None
     try:
+        metadata = _load_session_metadata_sidecar(p)
+        if metadata is not None:
+            return _parse_nonnegative_int(metadata.get('message_count'))
+    except Exception:
+        pass
+    try:
         prefix = _read_metadata_json_prefix(p)
         if prefix:
             parsed = json.loads(prefix)
-            count = _parse_nonnegative_int(parsed.get('message_count'))
-            if count is not None:
-                return count
+            return _parse_nonnegative_int(parsed.get('message_count'))
     except Exception:
-        # Fall through to the index-based fallback below.
         pass
     return _parse_nonnegative_int(_lookup_index_message_count(sid))
 
@@ -4243,6 +4543,182 @@ def _sidebar_title_is_generic_webui(title: str | None) -> bool:
     return text.startswith(prefix) and text[len(prefix):].isdigit()
 
 
+# Cache for expensive state.db sidebar override queries. The key is a
+# deterministic fingerprint of the inputs; the TTL is intentionally short
+# (sub-second) so state.db changes are reflected quickly while still
+# coalescing concurrent /api/sessions rebuilds. This is especially important
+# when multiple tabs poll: without it every rebuild pays the full state.db
+# aggregation cost.
+_STATE_DB_SIDEBAR_OVERRIDES_CACHE: dict[tuple, tuple[dict[str, dict], float]] = {}
+_STATE_DB_SIDEBAR_OVERRIDES_CACHE_LOCK = threading.Lock()
+_STATE_DB_SIDEBAR_OVERRIDES_CACHE_TTL_SECONDS = 1.5
+
+# Short-lived memo for the full all_sessions() result. The session-list cache
+# in route_session_list_cache.py handles inter-request reuse, but a single
+# streaming turn can invalidate that cache many times per second (state.db
+# fingerprint churn + session list publishes). This memo bounds the CPU work
+# for back-to-back all_sessions() calls with identical dependencies.
+_ALL_SESSIONS_RESULT_CACHE: dict[tuple, tuple[list[dict], float]] = {}
+_ALL_SESSIONS_RESULT_CACHE_LOCK = threading.Lock()
+_ALL_SESSIONS_RESULT_CACHE_TTL_SECONDS = 0.5
+
+
+def _all_sessions_result_cache_key(include_lineage_metadata: bool) -> tuple | None:
+    """Return a cache key for all_sessions() based on its external inputs.
+
+    Includes the active stream/run registry sizes so that adding or removing a
+    stream immediately invalidates the memo (e.g. SSE connect/disconnect, tests
+    that mutate STREAMS directly). The state.db invalidation uses the cheap
+    content fingerprint rather than volatile file stats, so back-to-back polls
+    while no streaming turn is in progress coalesce cleanly.
+    """
+    try:
+        index_mtime_ns = SESSION_INDEX_FILE.stat().st_mtime_ns
+    except OSError:
+        index_mtime_ns = None
+    db_path = _active_state_db_path()
+    db_fingerprint = _sqlite_content_fingerprint(db_path)
+    try:
+        streams_len = len(STREAMS)
+    except Exception:
+        streams_len = -1
+    try:
+        runs_len = len(_cfg.ACTIVE_RUNS)
+    except Exception:
+        runs_len = -1
+    return (
+        str(SESSION_DIR),
+        index_mtime_ns,
+        db_fingerprint,
+        include_lineage_metadata,
+        streams_len,
+        runs_len,
+    )
+
+
+def _get_cached_all_sessions_result(key: tuple) -> list[dict] | None:
+    """Return a fresh copy of a recent all_sessions() result, or None."""
+    now = time.monotonic()
+    with _ALL_SESSIONS_RESULT_CACHE_LOCK:
+        cached = _ALL_SESSIONS_RESULT_CACHE.get(key)
+        if cached is not None:
+            result, expires_at = cached
+            if now < expires_at:
+                logger.debug("all_sessions() result cache hit")
+                # Return a list of shallow row copies; fast enough for the hot
+                # path while protecting the cached dicts from caller mutation.
+                return [dict(row) for row in result]
+            _ALL_SESSIONS_RESULT_CACHE.pop(key, None)
+    return None
+
+
+def _set_cached_all_sessions_result(key: tuple, result: list[dict]) -> None:
+    """Store a copy of an all_sessions() result for a short TTL."""
+    with _ALL_SESSIONS_RESULT_CACHE_LOCK:
+        # Shallow copy each row once on insertion so the cache owns its rows.
+        _ALL_SESSIONS_RESULT_CACHE[key] = (
+            [dict(row) for row in result],
+            time.monotonic() + _ALL_SESSIONS_RESULT_CACHE_TTL_SECONDS,
+        )
+        # Keep the cache small: evict expired entries, then oldest if still over cap.
+        now = time.monotonic()
+        expired = [k for k, (_, exp) in _ALL_SESSIONS_RESULT_CACHE.items() if now >= exp]
+        for k in expired:
+            _ALL_SESSIONS_RESULT_CACHE.pop(k, None)
+        if len(_ALL_SESSIONS_RESULT_CACHE) > 8:
+            items = sorted(
+                _ALL_SESSIONS_RESULT_CACHE.items(),
+                key=lambda kv: kv[1][1],
+            )
+            for k, _ in items[: len(items) - 8]:
+                _ALL_SESSIONS_RESULT_CACHE.pop(k, None)
+
+
+def _state_db_sidebar_overrides_cache_key(
+    db_path: Path,
+    session_ids: set[str],
+    count_session_ids: set[str] | None,
+    fingerprint: object,
+) -> tuple:
+    # Sort the id sets so equivalent calls share a cache entry regardless of
+    # set iteration order.
+    return (
+        str(db_path),
+        fingerprint,
+        tuple(sorted(session_ids)),
+        tuple(sorted(count_session_ids)) if count_session_ids is not None else None,
+    )
+
+
+def _cached_read_state_db_sidebar_overrides(
+    db_path: Path,
+    session_ids: set[str],
+    count_session_ids: set[str] | None,
+) -> dict[str, dict]:
+    """Return state.db sidebar overrides, caching the result briefly.
+
+    The cache is keyed by the state.db content fingerprint (cheap O(1)
+    MAX(rowid) lookup) plus the requested session id sets. This lets concurrent
+    /api/sessions rebuilds coalesce on the same state.db snapshot without
+    blocking on a long SQL aggregation.
+    """
+    fingerprint = _sqlite_content_fingerprint(db_path)
+    if fingerprint is None:
+        # DB not readable / no safe invalidation key; fall back to uncached.
+        return _read_state_db_sidebar_overrides(
+            db_path, session_ids, count_session_ids=count_session_ids,
+        )
+    key = _state_db_sidebar_overrides_cache_key(
+        db_path, session_ids, count_session_ids, fingerprint,
+    )
+    now = time.monotonic()
+    with _STATE_DB_SIDEBAR_OVERRIDES_CACHE_LOCK:
+        cached = _STATE_DB_SIDEBAR_OVERRIDES_CACHE.get(key)
+        if cached is not None:
+            metadata, expires_at = cached
+            if now < expires_at:
+                logger.debug(
+                    "state.db sidebar overrides cache hit for %s (fingerprint=%s, ids=%d)",
+                    db_path, fingerprint, len(session_ids),
+                )
+                return metadata
+            # Expired; remove to avoid unbounded growth.
+            _STATE_DB_SIDEBAR_OVERRIDES_CACHE.pop(key, None)
+
+    metadata = _read_state_db_sidebar_overrides(
+        db_path, session_ids, count_session_ids=count_session_ids,
+    )
+
+    with _STATE_DB_SIDEBAR_OVERRIDES_CACHE_LOCK:
+        _STATE_DB_SIDEBAR_OVERRIDES_CACHE[key] = (
+            metadata,
+            now + _STATE_DB_SIDEBAR_OVERRIDES_CACHE_TTL_SECONDS,
+        )
+        # Best-effort bounded cleanup. If the cache grew past the cap (can happen
+        # when many distinct fingerprints arrive within a single TTL window),
+        # evict oldest entries by expiration time. Expired entries are always
+        # removed first; if there still aren't enough, fall back to oldest live.
+        if len(_STATE_DB_SIDEBAR_OVERRIDES_CACHE) > 128:
+            expired_keys = [
+                k for k, (_, exp) in _STATE_DB_SIDEBAR_OVERRIDES_CACHE.items()
+                if now >= exp
+            ]
+            for k in expired_keys:
+                _STATE_DB_SIDEBAR_OVERRIDES_CACHE.pop(k, None)
+        if len(_STATE_DB_SIDEBAR_OVERRIDES_CACHE) > 128:
+            items = sorted(
+                _STATE_DB_SIDEBAR_OVERRIDES_CACHE.items(),
+                key=lambda kv: kv[1][1],
+            )
+            for k, _ in items[: len(items) - 128]:
+                _STATE_DB_SIDEBAR_OVERRIDES_CACHE.pop(k, None)
+    logger.debug(
+        "state.db sidebar overrides cache miss for %s (fingerprint=%s, ids=%d)",
+        db_path, fingerprint, len(session_ids),
+    )
+    return metadata
+
+
 def _read_state_db_sidebar_overrides(
     db_path: Path,
     session_ids: set[str],
@@ -4395,7 +4871,7 @@ def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
     else:
         count_ids = None  # cap disabled / under cap -> count every row too
     try:
-        metadata = _read_state_db_sidebar_overrides(
+        metadata = _cached_read_state_db_sidebar_overrides(
             _active_state_db_path(),
             all_ids,
             count_session_ids=count_ids,
@@ -4535,7 +5011,15 @@ def _diag_stage(diag, name: str) -> None:
 
 def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
     _diag_stage(diag, "all_sessions.active_streams")
-    active_stream_ids = _active_stream_ids()
+
+    # Short-lived memo: coalesce back-to-back rebuilds with identical deps.
+    cache_key = _all_sessions_result_cache_key(include_lineage_metadata)
+    cached = _get_cached_all_sessions_result(cache_key) if cache_key else None
+    if cached is not None:
+        _diag_stage(diag, "all_sessions.memo_hit")
+        return cached
+
+    active_stream_ids = _cached_active_stream_ids()
     # Phase C: try index first for O(1) read; fall back to full scan
     _diag_stage(diag, "all_sessions.index_exists")
     if not SESSION_INDEX_FILE.exists():
@@ -4684,6 +5168,8 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
             for s in result:
                 if not s.get('profile'):
                     s['profile'] = 'default'
+            if cache_key is not None:
+                _set_cached_all_sessions_result(cache_key, result)
             return result
         except Exception:
             logger.debug("Failed to load session index, falling back to full scan")
@@ -4737,6 +5223,8 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
     for s in result:
         if not s.get('profile'):
             s['profile'] = 'default'
+    if cache_key is not None:
+        _set_cached_all_sessions_result(cache_key, result)
     return result
 
 
