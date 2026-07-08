@@ -5260,6 +5260,13 @@ def _is_loadable_disk_cache(cache: object) -> bool:
          If the runtime version cannot be resolved (early-init edge case),
          skip this check rather than wedge the boot.
 
+    EXCEPTION: dirty builds. For local development / un-tagged deployments the
+    WebUI version string is ``vX.Y.Z-dirty-<hash>`` where the hash changes on
+    every build. Treating each dirty hash as a new release effectively disables
+    the disk cache across restarts, forcing a multi-second (or minute-long) live
+    provider rebuild every time the server is restarted. As long as the
+    non-hash prefix and schema match, reuse the cache for dirty builds.
+
     Note: ``_webui_version`` is a string equality check, not a semver compare —
     two debug builds with the same `WEBUI_VERSION` string but different actual
     code wouldn't invalidate via this axis. ``_schema_version`` is the
@@ -5282,7 +5289,28 @@ def _is_loadable_disk_cache(cache: object) -> bool:
     runtime_version = _current_webui_version()
     if runtime_version is not None:
         cached_version = cache.get("_webui_version")
-        if not isinstance(cached_version, str) or cached_version != runtime_version:
+        if not isinstance(cached_version, str):
+            logger.debug(
+                "models cache rejected: webui_version=%r vs runtime=%r",
+                cached_version, runtime_version,
+            )
+            return False
+        if cached_version == runtime_version:
+            # Exact match, including the rare bare-dirty equal-strings case.
+            pass
+        elif (
+            isinstance(runtime_version, str)
+            and isinstance(cached_version, str)
+            and "-dirty" in runtime_version
+            and "-dirty" in cached_version
+            and runtime_version.split("-dirty", 1)[0]
+            == cached_version.split("-dirty", 1)[0]
+        ):
+            logger.debug(
+                "models cache accepted across dirty build: %r vs %r",
+                cached_version, runtime_version,
+            )
+        else:
             logger.debug(
                 "models cache rejected: webui_version=%r vs runtime=%r",
                 cached_version, runtime_version,
@@ -7223,6 +7251,17 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         _current_mtime = 0.0
     _cfg_changed = _current_mtime != _cfg_mtime
 
+    # ── FAST PATH: in-memory cache hit ────────────────────────────────────────
+    # If the catalog is already warm and the source fingerprint has not changed,
+    # return it immediately without touching the lock or disk. This keeps the
+    # high-volume /api/models endpoint fast and prevents a slow concurrent
+    # rebuild from blocking every caller.
+    now = time.monotonic()
+    if _available_models_cache is not None and not force_refresh:
+        cached = _get_fresh_memory_models_cache(now)
+        if cached is not None:
+            return copy.deepcopy(cached)
+
     # Disk load BEFORE lock: ~0.1ms, lets concurrent requests skip entirely.
     # Then acquire lock and check memory cache.  Cold path runs inside the lock
     # so only one thread rebuilds while others wait.
@@ -7236,10 +7275,13 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         stale_disk_groups = _load_stale_models_cache_from_disk()
 
     with _available_models_cache_lock:
-        # If another thread is already building, wait for its result instead
-        # of re-entering the cold path (avoids duplicate 10s zai load_pool calls).
+        # If another thread is already building, wait briefly for its result
+        # rather than re-entering the cold path. We cap the wait at the live
+        # rebuild budget so a slow/hung provider probe does not pin every
+        # concurrent /api/models caller for 60 seconds. If the build is still
+        # in flight after the budget, we fall through to the fallback path below.
         if should_wait:
-            wait_timeout = 60.0
+            wait_timeout = max(2.0, _LIVE_REBUILD_BUDGET_SECONDS)
             if force_refresh and force_refresh_started_at is not None:
                 if _LIVE_REBUILD_BUDGET_SECONDS <= 0:
                     # The legacy synchronous path is explicitly unbounded. A
@@ -7269,6 +7311,14 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             ):
                 return cached
             if force_refresh and _LIVE_REBUILD_BUDGET_SECONDS > 0 and _cache_build_in_progress:
+                if stale_disk_groups is not None:
+                    return copy.deepcopy(stale_disk_groups)
+                return copy.deepcopy(_static_models_catalog_without_live_probes())
+            # Non-force-refresh follower that timed out while the build is still
+            # running: return the best fallback immediately. Do NOT start another
+            # rebuild: that defeats the coalescing logic and can pin every caller
+            # for the full unbounded probe duration (#perf).
+            if _cache_build_in_progress and not force_refresh:
                 if stale_disk_groups is not None:
                     return copy.deepcopy(stale_disk_groups)
                 return copy.deepcopy(_static_models_catalog_without_live_probes())
