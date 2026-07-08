@@ -8669,6 +8669,7 @@ from api.models import (
     _clear_webui_zero_message_orphan_tombstone,
     _load_webui_deleted_session_tombstone,
     _record_webui_deleted_session_tombstone,
+    _delete_session_metadata_sidecar,
     ensure_cron_project,
     _profile_has_user_projects,
     is_cron_session,
@@ -11961,6 +11962,7 @@ def handle_get(handler, parsed) -> bool:
                 compact_session = s.compact(
                     include_runtime=True,
                     active_stream_ids=active_stream_ids,
+                    metadata_only=not load_messages,
                 )
             except TypeError:
                 compact_session = s.compact()
@@ -13816,6 +13818,10 @@ def handle_post(handler, parsed) -> bool:
             prune_session_from_index(sid)
         except Exception:
             logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
+        try:
+            _delete_session_metadata_sidecar(p)
+        except Exception:
+            logger.debug("Failed to unlink session metadata sidecar %s", p.with_suffix('.json.meta'))
         if sidecar_deleted and not is_messaging_session:
             try:
                 _record_webui_deleted_session_tombstone(sid)
